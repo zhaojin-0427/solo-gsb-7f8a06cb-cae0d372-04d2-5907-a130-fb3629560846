@@ -49,13 +49,30 @@ the service checks, independently, that:
 are returned per node, sorted by node name; the reason codes inside a
 node's list are sorted too, so the request payload order never matters.
 
+Issuance
+---------
+The companion :func:`issue_provenance` powers ``POST /provenance/issue``.
+Given the graph, the target, a node -> signer id assignment covering
+exactly the target closure and a signer id -> Base64 raw 32-byte
+Ed25519 private key seed table covering exactly the used signers, it
+recomputes fingerprints in topological order and walks the closure in that
+same order: each dependency attestation digest therefore already exists when the
+parent is signed.  The produced attestations and the derived public-key table
+are byte-for-byte acceptable to :func:`verify_provenance`, i.e.
+resubmitting them yields ``trusted=true``.  Private seeds are used only to
+sign; they are never echoed in the response or in any error message.
+
 Hard errors (HTTP 400)
 ----------------------
 Malformed graphs (duplicate node, missing dependency, cycle), unknown
 targets, duplicate attestations for the same closure node, attestations
 for nodes outside the closure (including nodes absent from the graph) and
 malformed Base64 or wrong key/signature lengths produce structured
-``PlanError`` responses instead of a trusted/untrusted verdict.
+``PlanError`` responses instead of a trusted/untrusted verdict.  Issuance
+additionally rejects signer assignments missing closure nodes or naming nodes
+outside the closure, private-key tables missing used signers or carrying
+unused entries, and malformed private-key seeds -- reporting node/signer ids
+only, never the key material.
 """
 from __future__ import annotations
 
@@ -65,11 +82,16 @@ import hashlib
 import json
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from app.models import (
     Attestation,
     Node,
+    ProvenanceIssueResponse,
     ProvenanceVerifyResponse,
 )
 from app.planner import (
@@ -79,6 +101,7 @@ from app.planner import (
 )
 
 PUBLIC_KEY_BYTES = 32
+PRIVATE_KEY_BYTES = 32
 SIGNATURE_BYTES = 64
 
 
@@ -264,4 +287,156 @@ def verify_provenance(
     return ProvenanceVerifyResponse(trusted=not reasons, reasons=reasons)
 
 
-__all__ = ["attestation_digest", "attestation_message", "verify_provenance"]
+def _decode_private_keys(private_keys: dict) -> dict[str, Ed25519PrivateKey]:
+    """Base64-decode every Ed25519 private seed; report malformed signer ids only.
+
+    Key material itself is never placed in error messages or details.
+    """
+    malformed: list[str] = []
+    decoded: dict[str, Ed25519PrivateKey] = {}
+    for signer_id in sorted(private_keys, key=lambda v: str(v)):
+        encoded = private_keys[signer_id]
+        if not isinstance(encoded, str) or not encoded:
+            malformed.append(signer_id)
+            continue
+        try:
+            seed = _b64decode(encoded)
+        except (binascii.Error, ValueError):
+            malformed.append(signer_id)
+            continue
+        if len(seed) != PRIVATE_KEY_BYTES:
+            malformed.append(signer_id)
+            continue
+        decoded[signer_id] = Ed25519PrivateKey.from_private_bytes(seed)
+    if malformed:
+        raise PlanError(
+            "malformed_encoding",
+            "Private keys must be standard Base64 of a 32-byte "
+            "Ed25519 private key seed",
+            {"private_keys": malformed},
+        )
+    return decoded
+
+
+def issue_provenance(
+    nodes: list[Node],
+    target: str,
+    signers: dict[str, str],
+    private_keys: dict,
+) -> ProvenanceIssueResponse:
+    """Sign one provenance attestation per closure node; verify-ready output."""
+    graph, contents, order = validate_graph(nodes)
+
+    # ---- validation: target resolves -------------------------------------
+    if target not in graph:
+        raise PlanError(
+            "unknown_target",
+            f"Target node is not in the graph: {target!r}",
+            {"target": target},
+        )
+
+    closure = _dependency_closure(graph, target)
+
+    # ---- validation: node -> signer map covers the closure exactly ---------
+    assigned = set(signers)
+    missing_signers = sorted(closure - assigned)
+    if missing_signers:
+        raise PlanError(
+            "missing_node_signer",
+            "Every node in the target closure must name a signer",
+            {"nodes": missing_signers},
+        )
+    extra_signers = sorted(assigned - closure)
+    if extra_signers:
+        raise PlanError(
+            "unexpected_node_signer",
+            "Signers may only be assigned to nodes in the target closure",
+            {"nodes": extra_signers, "target": target},
+        )
+
+    # ---- validation: private-key table shape (keys are non-empty strings;
+    # values are checked by the decoder; values are never echoed) -------------
+    malformed_key_signers = sorted(
+        signer_id
+        for signer_id in private_keys
+        if not isinstance(signer_id, str) or not signer_id.strip()
+    )
+    if malformed_key_signers:
+        raise PlanError(
+            "malformed_encoding",
+            "Private-key signer ids must be non-empty strings",
+            {"private_keys": malformed_key_signers},
+        )
+
+    # ---- validation: private-key table covers used signers exactly ----------
+    used_signers = {signers[name] for name in closure}
+    key_signers = set(private_keys)
+    missing_keys = sorted(used_signers - key_signers)
+    if missing_keys:
+        raise PlanError(
+            "missing_private_key",
+            "Every used signer id must have a private key",
+            {"signers": missing_keys},
+        )
+    extra_keys = sorted(key_signers - used_signers)
+    if extra_keys:
+        raise PlanError(
+            "unexpected_private_key",
+            "Private keys must cover exactly the signers used in the closure",
+            {"signers": extra_keys},
+        )
+
+    # ---- validation: Base64-encoded 32-byte private seeds ---------------
+    signing_keys = _decode_private_keys(private_keys)
+
+    # ---- recompute fingerprints, then sign in topological order so each
+    # dependency attestation digest exists before the parent is signed -----------
+    fingerprints = compute_fingerprints(graph, contents, order)
+    digests: dict[str, str] = {}
+    by_node: dict[str, Attestation] = {}
+    for name in order:
+        if name not in closure:
+            continue
+        dependencies = {dep: digests[dep] for dep in graph[name]}
+        unsigned = Attestation.model_construct(
+            node=name,
+            fingerprint=fingerprints[name],
+            signer=signers[name],
+            dependencies=dependencies,
+            signature="",
+        )
+        message = attestation_message(unsigned)
+        signature = signing_keys[signers[name]].sign(message)
+        attestation = Attestation(
+            node=name,
+            fingerprint=fingerprints[name],
+            signer=signers[name],
+            dependencies=dependencies,
+            signature=base64.b64encode(signature).decode("ascii"),
+        )
+        digests[name] = hashlib.sha256(message).hexdigest()
+        by_node[name] = attestation
+
+    public_keys = {
+        signer_id: base64.b64encode(
+            signing_keys[signer_id]
+            .public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+        ).decode("ascii")
+        for signer_id in sorted(used_signers)
+    }
+    return ProvenanceIssueResponse(
+        attestations=[by_node[name] for name in sorted(closure)],
+        public_keys=public_keys,
+    )
+
+
+__all__ = [
+    "attestation_digest",
+    "attestation_message",
+    "issue_provenance",
+    "verify_provenance",
+]

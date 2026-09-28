@@ -760,3 +760,62 @@ class ProvenanceVerifyResponse(BaseModel):
             "dependency_digest_mismatch, invalid_signature."
         ),
     )
+
+
+# ----------------------------------------------------------- provenance issue
+
+
+class ProvenanceIssueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[Node] = Field(
+        ..., description="Build graph nodes (same schema as /plans)."
+    )
+    target: str = Field(
+        ..., min_length=1, description="Target node whose closure is attested."
+    )
+    signers: dict[str, str] = Field(
+        ...,
+        description=(
+            "Closure node name -> signer id that signs that node's attestation. "
+            "The keys must cover exactly the target's dependency closure: every "
+            "closure node must appear once and no other node may appear."
+        ),
+    )
+    private_keys: dict = Field(
+        ...,
+        description=(
+            "Signer id -> Base64-encoded raw 32-byte Ed25519 private key "
+            "seed.  The keys must cover exactly the signer ids used in "
+            "`signers`: neither missing nor extra entries are allowed.  Values are "
+            "never echoed in the response, logs or error details."
+        ),
+    )
+
+    @field_validator("signers")
+    @classmethod
+    def _validate_signers(cls, value: dict[str, str]) -> dict[str, str]:
+        for node_name, signer_id in value.items():
+            if not isinstance(node_name, str) or not node_name.strip():
+                raise ValueError("signer node names must be non-empty strings")
+            if not isinstance(signer_id, str) or not signer_id.strip():
+                raise ValueError("signer ids must be non-empty strings")
+        return value
+
+
+class ProvenanceIssueResponse(BaseModel):
+    attestations: list[Attestation] = Field(
+        ...,
+        description=(
+            "Signed attestations, one per closure node, sorted by node name; "
+            "ready to POST to /provenance/verify."
+        ),
+    )
+    public_keys: dict[str, str] = Field(
+        ...,
+        description=(
+            "Signer id -> Base64-encoded 32-byte raw Ed25519 public key "
+            "derived from the supplied private seed, for every used signer; "
+            "usable verbatim as /provenance/verify's trusted_keys."
+        ),
+    )

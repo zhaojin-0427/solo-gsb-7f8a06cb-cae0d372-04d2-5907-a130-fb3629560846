@@ -49,6 +49,13 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 签名，任一不符即返回 `trusted=false` 与按节点名排序的原因（详见下文对应
 章节）。
 
+`POST /provenance/issue` 面向**构建结果证明链签发**：沿用 `/plans` 的 `nodes`
+与目标节点，另给“闭包节点名 → 签署者 ID”和“签署者 ID → Base64 原始
+32 字节 Ed25519 私钥种子”两张映射；服务按拓扑序重算指纹、先生成依赖证明
+摘要，再用对应私钥对与 `/provenance/verify` **完全相同**的紧凑 JSON 字节
+签名，返回按节点名排序的证明及对应公钥表——可直接提交核验接口得到
+`trusted=true`（详见下文对应章节）。
+
 `POST /failure-probes` 面向**单故障构建的探测规划**：沿用 `/plans` 的节点图，
 给出已知构建失败的目标节点及可选的已完成探测（节点名与通过/失败结果）；
 服务先按观测把目标依赖闭包（最多 10 个节点，假定其中恰有一个故障节点）中
@@ -61,7 +68,7 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 
 ```
 app/
-  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/failure-probes、/release-bundles、/release-transitions、/release-policies、/provenance/verify、GET /health
+  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/failure-probes、/release-bundles、/release-transitions、/release-policies、/provenance/verify、/provenance/issue、GET /health
   models.py     # 请求/响应 Pydantic 模型
   planner.py    # 图校验、指纹、拓扑排序、缓存判定与批次划分（纯函数核心）
   impacts.py    # 两图对比、根因识别与最短传导路径分析（纯函数核心）
@@ -72,7 +79,7 @@ app/
   bundles.py    # 依赖一致的发布制品包精确选择（纯函数核心）
   transitions.py# 发布包之间最少步骤的逐节点制品切换规划（纯函数核心）
   policies.py   # 组织条款标签的发布判定（纯函数核心）
-  provenance.py # Ed25519 签名构建结果证明链的核验（纯函数核心）
+  provenance.py # Ed25519 签名构建结果证明链的核验与签发（纯函数核心）
 tests/
   test_planner.py
   test_impacts.py
@@ -126,6 +133,13 @@ curl -s -X POST http://localhost:8000/release-transitions \
   -H 'Content-Type: application/json' \
   -d '{"nodes":[{"name":"a","content_digest":"a","dependency_names":[]}],"target":"a","artifacts":[{"id":"a1","node":"a","fingerprint":"f1","size":1,"dependencies":{}},{"id":"a2","node":"a","fingerprint":"f2","size":1,"dependencies":{}}],"current_ids":["a1"],"next_ids":["a2"]}'
 # {"possible":true,"steps":[{"node":"a","id":"a2","bundle":{"a":"a2"}}]}
+
+# 签发构建结果证明链（私钥仅用于签名，绝不出现在响应或错误中），
+# 返回的 attestations + public_keys 可直接提交 /provenance/verify：
+curl -s -X POST http://localhost:8000/provenance/issue \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":[{"name":"core","content_digest":"core-src-v1","dependency_names":[]},{"name":"util","content_digest":"util-src-v1","dependency_names":["core"]}],"target":"util","signers":{"core":"builder-1","util":"builder-1"},"private_keys":{"builder-1":"mWF1S/Qsd1Z1A2RE4tQFeDGofUyAaVdoAPQB6UBUnUA="}}'
+# {"attestations":[{"node":"core",...}],"public_keys":{"builder-1":"kegzJbcb8pwgmbAFCH74+A1gvtw+MJImy+FxRK/RxAw="}}
 ```
 
 ## 请求示例
@@ -1377,6 +1391,144 @@ curl -s -X POST http://localhost:8000/provenance/verify \
 }
 ```
 
+## POST /provenance/issue：构建结果证明链签发
+
+`POST /provenance/issue` 是 `/provenance/verify` 的对偶：由掌握私钥的构建方
+为目标依赖闭包**一次性签发整链可直接通过核验**的构建结果证明。请求沿用
+`/plans` 的 `nodes` 与 `target`，另含两张映射：
+
+- `signers`：**闭包节点名 → 签署者 ID**，键集合必须与目标依赖闭包
+  **恰好一致**——闭包内每节点恰一项，不缺；闭包外节点（含图中不存在的
+  节点名）一律不得出现，不多；
+- `private_keys`：**签署者 ID → Base64 编码的原始 32 字节 Ed25519 私钥
+  种子**（即 Ed25519 的 32 字节 private seed，`Ed25519PrivateKey
+  .from_private_bytes` 的输入），键集合必须与 `signers` 实际用到的签署者
+  **恰好一致**——不多不少。
+
+签发流程（全程确定性，与请求书写顺序无关）：
+
+1. 图校验（重名、缺失依赖、成环）、目标解析、闭包计算，规则与
+   `/provenance/verify` 完全相同；
+2. 用 `/plans` 的规则按拓扑序重算指纹；
+3. 沿**拓扑序**逐节点处理闭包：先生成各直接依赖的证明摘要（父节点被处理时
+   所有子依赖证明必然已就绪），再构造与核验端**完全相同**的证明结构
+   `[node, fingerprint, signer, [[依赖名, 依赖证明摘要] for 依赖名 in
+   sorted(dependencies)]]`，编码为 `json.dumps(..., separators=(",",":"),
+   ensure_ascii=False)` 的 **UTF-8 紧凑 JSON 字节**（非 ASCII 原样输出、不
+   转义）；该字节的 SHA-256 小写十六进制即**证明摘要**；
+4. 用该节点签署者对应的私钥对**这段 JSON 字节本身**（而非摘要字符串）做
+   Ed25519 签名，再 Base64 编码；
+5. 由每粒私钥种子派生 32 字节原始公钥并 Base64 编码，供核验端受信表使用。
+
+响应字段：
+
+- `attestations`：闭包内每节点一份证明，结构与 `/provenance/verify` 请求中的
+  证明**逐字段一致**，按节点名排序；
+- `public_keys`：每个实际使用的签署者 ID → Base64 公钥的映射。
+
+把响应中的 `attestations` 原样作为 `attestations`、`public_keys` 原样作为
+`trusted_keys`，连同同一组 `nodes` 与 `target` 提交 `/provenance/verify`，
+必然得到 `{"trusted": true, "reasons": {}}`。**私钥种子只用于内存中的签名
+计算**：不会出现在响应、服务日志或任何错误信息中（错误详情只列出签署者 ID /
+节点名）。
+
+### 调用示例
+
+下图：`util` 依赖 `core`，目标为 `util`（闭包为 `{core, util}`，`docs`
+在闭包外）。两节点均由签署者 `builder-1` 签署，其 32 字节私钥种子以
+Base64 提供：
+
+```bash
+curl -s -X POST http://localhost:8000/provenance/issue \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "core", "content_digest": "core-src-v1", "dependency_names": []},
+      {"name": "util", "content_digest": "util-src-v1", "dependency_names": ["core"]},
+      {"name": "docs", "content_digest": "docs-src-v1", "dependency_names": []}
+    ],
+    "target": "util",
+    "signers": {"core": "builder-1", "util": "builder-1"},
+    "private_keys": {
+      "builder-1": "mWF1S/Qsd1Z1A2RE4tQFeDGofUyAaVdoAPQB6UBUnUA="
+    }
+  }'
+```
+
+响应（`201 Created`，证明按节点名排序；私钥不出现在任何位置）：
+
+```json
+{
+  "attestations": [
+    {
+      "node": "core",
+      "fingerprint": "b53b764e740673cd4449f872a6cdea0998cbd5d92d2d706820ec010a56e0a714",
+      "signer": "builder-1",
+      "dependencies": {},
+      "signature": "FIuHzVQUY5GursLAKIinbwak0sDffPFx4D4GznlZx6BBMtPZkVYKquvEopQWSu39y6BPHtzBKSYE1nOATAWqBA=="
+    },
+    {
+      "node": "util",
+      "fingerprint": "30c69063e340908c43750e92d696cc9410c09814fef4510c05829ceadc7ca3b8",
+      "signer": "builder-1",
+      "dependencies": {"core": "35fda4461d08d70d865b13d5c63d4a1cba1bf5a00dabf651e42a89464e3ec4e6"},
+      "signature": "RLMEy8ak2JPrxdUh7x0BXVU1mkaQiLpXJTeX+sWewMj60FQxwjFgU28AjWBPu8f4n7qr960/Wv8AgjRVOSxPDg=="
+    }
+  ],
+  "public_keys": {
+    "builder-1": "kegzJbcb8pwgmbAFCH74+A1gvtw+MJImy+FxRK/RxAw="
+  }
+}
+```
+
+直接回灌核验（同一 `nodes` / `target`）：
+
+```bash
+curl -s -X POST http://localhost:8000/provenance/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "core", "content_digest": "core-src-v1", "dependency_names": []},
+      {"name": "util", "content_digest": "util-src-v1", "dependency_names": ["core"]},
+      {"name": "docs", "content_digest": "docs-src-v1", "dependency_names": []}
+    ],
+    "target": "util",
+    "attestations": [ /* 上一步响应的 attestations 原样填入 */ ],
+    "trusted_keys": {
+      "builder-1": "kegzJbcb8pwgmbAFCH74+A1gvtw+MJImy+FxRK/RxAw="
+    }
+  }'
+# {"trusted": true, "reasons": {}}
+```
+
+不同节点可使用不同签署者：只需在 `signers` 中分别指定，并在 `private_keys`
+中提供每个**实际使用**签署者的私钥（例如
+`{"core": "builder-1", "util": "builder-2"}` 配
+`{"builder-1": "…", "builder-2": "…"}`）；菱形闭包中被共享的依赖只生成一份
+证明，两个父节点引用同一摘要。节点名、内容摘要与签署者 ID 均可含非 ASCII
+字符（如 `"café"`、`"签署者α"`），签名按字面 UTF-8 字节计算。
+
+**硬性错误（HTTP `400`，且均不回显私钥内容）**：
+
+- 图本身的 `duplicate_node`、`missing_dependency`、`cycle_detected` 与
+  `/plans` 一致；
+- `unknown_target`：目标不在图中；
+- `missing_node_signer`：闭包中有节点没有在 `signers` 中指定签署者
+  （`details.nodes` 列出缺失节点）；
+- `unexpected_node_signer`：`signers` 为闭包外节点（含图中不存在的节点名）
+  指定了签署者（`details.nodes` 与 `details.target`）；
+- `missing_private_key`：实际使用的签署者 ID 没有对应私钥
+  （`details.signers`）；
+- `unexpected_private_key`：`private_keys` 提供了未被任何闭包节点使用的签署者
+  密钥（`details.signers`）；
+- `malformed_encoding`：私钥不是**标准 Base64**（拒绝 URL-safe 变体与尾随
+  杂字符）、解码后不是 32 字节、值为空或非字符串（`details.private_keys`
+  列出签署者 ID）。
+
+空节点名/目标、`signers` 中的空节点名或空签署者 ID、未知字段等由 Pydantic
+拒绝（HTTP `422`）。`nodes`、`signers` 与 `private_keys` 的书写顺序均不
+影响结果。
+
 ## 指纹与批次的计算规则
 
 **指纹**（按拓扑序计算）：
@@ -1427,6 +1579,7 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | POST   | `/release-transitions`| 规划两包间最少步骤的逐节点制品切换         |
 | POST   | `/release-policies`   | 沿 bundled 边闭包判定组织条款能否发布      |
 | POST   | `/provenance/verify`  | 重算闭包指纹并核验 Ed25519 签名证明链      |
+| POST   | `/provenance/issue`   | 用 Ed25519 私钥种子签发可直接核验的证明链  |
 
 `/plans` 请求体字段：
 
@@ -1559,6 +1712,23 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 全通过时为 `{}`）。重复证明、闭包外证明、未知目标、无效图、畸形 Base64
 编码等返回 HTTP `400`（错误码见上文对应章节）。
 
+`/provenance/issue` 请求体字段：
+
+| 字段                          | 类型                  | 说明                                                |
+|-------------------------------|-----------------------|-----------------------------------------------------|
+| `nodes`                       | Node[]                | 节点图（字段同 `/plans`）                           |
+| `target`                      | string（非空）        | 签发目标节点，必须在图中                            |
+| `signers`                     | object<string,string> | 闭包节点名 → 签署者 ID，键集须与目标闭包恰好一致  |
+| `private_keys`                | object<string,string> | 签署者 ID → Base64 编码的 32 字节原始 Ed25519 私钥种子，键集须恰好覆盖所用签署者；永不回显 |
+
+响应字段：`attestations`（每闭包节点一份、按节点名排序的签名证明，字段与
+`/provenance/verify` 的 `Attestation` 完全一致，可直接回灌核验）、
+`public_keys`（所用签署者 ID → Base64 32 字节原始公钥，可直接作为核验接口的
+`trusted_keys`）。闭包覆盖不符、签署者/私钥映射缺项或多项、未知目标、无效
+图、私钥 Base64/长度畸形等返回 HTTP `400`（错误码 `missing_node_signer` /
+`unexpected_node_signer` / `missing_private_key` / `unexpected_private_key` /
+`malformed_encoding` / `unknown_target` / 图错误，详见上文对应章节）。
+
 ## 本地开发与测试（不使用 Docker）
 
 需要 Python 3.11+：
@@ -1572,7 +1742,7 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试共 370 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
+测试共 407 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
 缺失依赖、环（含自环）、重名、顺序无关性、两图对比的根因识别、最短传导
 路径与字典序取舍、双图分别校验、缓存保留的最优选择与字典序平局取舍、
 候选上限与各类引用错误、执行事件回放的合法性与违规忽略、失败节点的
@@ -1592,4 +1762,7 @@ blocked 传递、重复 seq 与未知节点错误、失败隔离的最小成本�
 Ed25519 签名链与多签署者、指纹/依赖名/依赖摘要/签署者/签名各项不符的
 按节点排序原因、闭包缺证明与依赖摘要断链、输入顺序无关性、重复证明、
 闭包外证明与图外证明、未知目标与无效图、Base64/长度畸形的密钥与签名
-编码错误，以及全部 HTTP 状态码。
+编码错误，证明链签发的拓扑序签发与金签向量、签发结果回灌核验必得
+trusted、多签署者公钥表、闭包恰好覆盖与私钥映射恰好覆盖、非 ASCII
+不转义、输入顺序无关性、私钥在响应与错误中绝不回显、各类畸形私钥与
+映射缺/多错误，以及全部 HTTP 状态码。
